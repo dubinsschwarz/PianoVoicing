@@ -8,7 +8,7 @@ MuseScore {
 
     menuPath: "Plugins.Piano Voicing"
     description: "Automatically adjusts piano note velocity offsets"
-    version: "0.6"
+    version: "0.7"
     pluginType: "dock"
     dockArea: "right"
 
@@ -17,36 +17,6 @@ MuseScore {
 
     property bool processingScore: false
     property bool pluginStarted: false
-
-    /*
-     * Normal processing changes only notes whose velocity offset is 0.
-     * Any non-zero offset is preserved as a manual or existing value.
-     * Forced processing is used only after confirmation for a selected range.
-     */
-    function applyOffset(note, desiredOffset, force) {
-        var currentOffset = note.veloOffset;
-
-        if (!force && currentOffset !== 0) {
-            return {
-                changed: false,
-                skippedManual: true
-            };
-        }
-
-        if (currentOffset === desiredOffset) {
-            return {
-                changed: false,
-                skippedManual: false
-            };
-        }
-
-        note.veloOffset = desiredOffset;
-
-        return {
-            changed: true,
-            skippedManual: false
-        };
-    }
 
     function getVoiceOffset(voiceIndex) {
         switch (voiceIndex) {
@@ -63,13 +33,6 @@ MuseScore {
         }
     }
 
-    /*
-     * Returns the active range-selection boundaries.
-     *
-     * startTick is included; endTick is excluded.
-     * startStaff and endStaff are treated as inclusive, matching the
-     * Selection properties in MuseScore 3.5.
-     */
     function selectedRange(score) {
         if (!score.selection || !score.selection.isRange)
             return null;
@@ -98,10 +61,6 @@ MuseScore {
                staffIndex <= range.endStaff;
     }
 
-    /*
-     * Scans one staff in all four voices.
-     * Notes are grouped by their starting tick.
-     */
     function collectNotesByTick(score, staffIndex, range) {
         var notesByTick = {};
 
@@ -150,10 +109,80 @@ MuseScore {
 
     function emptyResult() {
         return {
-            positions: 0,
             notes: 0,
             changes: 0,
-            skippedManual: 0
+            protectedNotes: 0
+        };
+    }
+
+    function arrayContains(values, value) {
+        for (var i = 0; i < values.length; ++i) {
+            if (values[i] === value)
+                return true;
+        }
+
+        return false;
+    }
+
+    /*
+     * Returns every offset this plugin could legitimately assign to a
+     * note in this voice for the specified hand.
+     *
+     * This is used to distinguish likely plugin-managed values from
+     * likely manual values.
+     */
+    function rightHandPluginValues(voiceIndex) {
+        var voiceOffset = getVoiceOffset(voiceIndex);
+
+        return [
+            Math.min(rhHighestNoteOffset.value, voiceOffset),
+            Math.min(rhOtherNotesOffset.value, voiceOffset)
+        ];
+    }
+
+    function leftHandPluginValues(voiceIndex) {
+        var voiceOffset = getVoiceOffset(voiceIndex);
+
+        return [
+            Math.min(lhHighestNoteOffset.value, voiceOffset),
+            Math.min(lhLowestNoteOffset.value, voiceOffset),
+            Math.min(lhOtherNotesOffset.value, voiceOffset)
+        ];
+    }
+
+    /*
+     * Normal processing:
+     * - Rewrites notes whose current offset matches any value the
+     *   plugin could have assigned for that hand and voice.
+     * - Preserves offsets outside that set as manual.
+     *
+     * Forced processing:
+     * - Used only after confirmation for the selected range.
+     * - Replaces all offsets in that range.
+     */
+    function applyOffset(note, desiredOffset, allowedPluginValues, force) {
+        var currentOffset = note.veloOffset;
+
+        if (!force &&
+                !arrayContains(allowedPluginValues, currentOffset)) {
+            return {
+                changed: false,
+                protectedNote: true
+            };
+        }
+
+        if (currentOffset === desiredOffset) {
+            return {
+                changed: false,
+                protectedNote: false
+            };
+        }
+
+        note.veloOffset = desiredOffset;
+
+        return {
+            changed: true,
+            protectedNote: false
         };
     }
 
@@ -170,7 +199,6 @@ MuseScore {
             if (records.length === 0)
                 continue;
 
-            ++result.positions;
             result.notes += records.length;
 
             var highestPitch = records[0].pitch;
@@ -188,22 +216,23 @@ MuseScore {
                         ? rhHighestNoteOffset.value
                         : rhOtherNotesOffset.value;
 
-                var finalOffset = Math.min(
+                var desiredOffset = Math.min(
                             positionOffset,
                             getVoiceOffset(record.voice)
                             );
 
                 var outcome = applyOffset(
                             record.note,
-                            finalOffset,
+                            desiredOffset,
+                            rightHandPluginValues(record.voice),
                             force
                             );
 
                 if (outcome.changed)
                     ++result.changes;
 
-                if (outcome.skippedManual)
-                    ++result.skippedManual;
+                if (outcome.protectedNote)
+                    ++result.protectedNotes;
             }
         }
 
@@ -223,7 +252,6 @@ MuseScore {
             if (records.length === 0)
                 continue;
 
-            ++result.positions;
             result.notes += records.length;
 
             var highestPitch = records[0].pitch;
@@ -241,10 +269,6 @@ MuseScore {
                 var record = records[j];
                 var positionOffset;
 
-                /*
-                 * Lowest-note priority means a one-note LH event is
-                 * treated as the bass note.
-                 */
                 if (record.pitch === lowestPitch) {
                     positionOffset = lhLowestNoteOffset.value;
                 } else if (record.pitch === highestPitch) {
@@ -253,37 +277,29 @@ MuseScore {
                     positionOffset = lhOtherNotesOffset.value;
                 }
 
-                var finalOffset = Math.min(
+                var desiredOffset = Math.min(
                             positionOffset,
                             getVoiceOffset(record.voice)
                             );
 
                 var outcome = applyOffset(
                             record.note,
-                            finalOffset,
+                            desiredOffset,
+                            leftHandPluginValues(record.voice),
                             force
                             );
 
                 if (outcome.changed)
                     ++result.changes;
 
-                if (outcome.skippedManual)
-                    ++result.skippedManual;
+                if (outcome.protectedNote)
+                    ++result.protectedNotes;
             }
         }
 
         return result;
     }
 
-    /*
-     * rangeOnly:
-     *   false = process the selected RH/LH staves across the score
-     *   true  = require and process only a range selection
-     *
-     * force:
-     *   false = preserve manual overrides
-     *   true  = overwrite overrides in the selected range
-     */
     function processScore(rangeOnly, force) {
         if (!pluginStarted)
             return;
@@ -364,7 +380,7 @@ MuseScore {
 
         var totalNotes = 0;
         var totalChanges = 0;
-        var totalSkippedManual = 0;
+        var totalProtected = 0;
 
         score.startCmd();
 
@@ -378,7 +394,7 @@ MuseScore {
 
             totalNotes += rhResult.notes;
             totalChanges += rhResult.changes;
-            totalSkippedManual += rhResult.skippedManual;
+            totalProtected += rhResult.protectedNotes;
         }
 
         if (processLh) {
@@ -391,7 +407,7 @@ MuseScore {
 
             totalNotes += lhResult.notes;
             totalChanges += lhResult.changes;
-            totalSkippedManual += lhResult.skippedManual;
+            totalProtected += lhResult.protectedNotes;
         }
 
         score.endCmd();
@@ -415,11 +431,11 @@ MuseScore {
                     (totalChanges === 1 ? " note." : " notes.");
         }
 
-        if (!force && totalSkippedManual > 0) {
-            message += " Preserved " + totalSkippedManual +
-                    (totalSkippedManual === 1
-                     ? " manual override."
-                     : " manual overrides.");
+        if (!force && totalProtected > 0) {
+            message += " Preserved " + totalProtected +
+                    (totalProtected === 1
+                     ? " manual offset."
+                     : " manual offsets.");
         }
 
         statusLabel.text = message;
@@ -469,7 +485,7 @@ MuseScore {
     MessageDialog {
         id: confirmReapplyDialog
         title: "Reapply selected range?"
-        text: "Replace manual velocity overrides in the selected range?"
+        text: "Replace velocity offsets in the selected range?"
         informativeText:
                 "Only enabled piano staves inside the current rectangular range will be changed."
         icon: StandardIcon.Warning
@@ -516,8 +532,8 @@ MuseScore {
                 width: parent.width
                 wrapMode: Text.WordWrap
                 text:
-                    "Normal processing changes only notes whose " +
-                    "velocity offset is 0. Any non-zero offset is preserved."
+                    "Offsets matching possible plugin values may be " +
+                    "recalculated. Other offsets are preserved as manual."
             }
 
             Label {
